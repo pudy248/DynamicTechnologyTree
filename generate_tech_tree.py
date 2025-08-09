@@ -452,12 +452,20 @@ class TechTreeGenerator:
         
         return entry
         
-    def _build_tech_subtree(self, tech_id: str, current_depth: int = 0, parent_tech_id: str = None, lang_code: str = "simp_chinese") -> List[str]:
+    def _build_tech_subtree(self, tech_id: str, current_depth: int = 0, parent_tech_id: str = None, lang_code: str = "simp_chinese", visited_techs: set = None) -> List[str]:
+        if visited_techs is None:
+            visited_techs = set()
+        
         if tech_id not in self.all_technologies:
+            return []
+        
+        if tech_id in visited_techs:
             return []
         
         tech = self.all_technologies[tech_id]
         lines = []
+        
+        visited_techs.add(tech_id)
         
         unlocked_techs = sorted(tech.unlocked_tech_ids, key=lambda tid: (
             self.all_technologies.get(tid, Technology(tid)).tier_level, tid
@@ -468,8 +476,10 @@ class TechTreeGenerator:
             if tech_line:
                 lines.append(tech_line)
             
-            subtree_lines = self._build_tech_subtree(unlock_id, current_depth + 1, unlock_id, lang_code)
+            subtree_lines = self._build_tech_subtree(unlock_id, current_depth + 1, unlock_id, lang_code, visited_techs.copy())
             lines.extend(subtree_lines)
+        
+        visited_techs.remove(tech_id)
                 
         return lines
         
@@ -559,6 +569,71 @@ class TechTreeGenerator:
             except (OSError, PermissionError) as e:
                 print(f"警告：无法写入文件 {file_path}: {e}")
 
+    def detect_circular_dependencies(self) -> List[List[str]]:
+        """检测科技树中的循环依赖并返回所有循环路径"""
+        cycles = []
+        visited = set()
+        rec_stack = set()
+        
+        def dfs_detect_cycle(tech_id: str, path: List[str]) -> None:
+            if tech_id in rec_stack:
+                cycle_start = path.index(tech_id)
+                cycle = path[cycle_start:] + [tech_id]
+                cycles.append(cycle)
+                return
+            
+            if tech_id in visited or tech_id not in self.all_technologies:
+                return
+            
+            visited.add(tech_id)
+            rec_stack.add(tech_id)
+            path.append(tech_id)
+            
+            tech = self.all_technologies[tech_id]
+            for unlock_id in tech.unlocked_tech_ids:
+                dfs_detect_cycle(unlock_id, path.copy())
+            
+            rec_stack.remove(tech_id)
+            path.pop()
+        
+        for tech_id in self.all_technologies:
+            if tech_id not in visited:
+                dfs_detect_cycle(tech_id, [])
+        
+        return cycles
+    
+    def report_circular_dependencies(self) -> None:
+        """检测并报告循环依赖"""
+        print("正在检测科技循环依赖...")
+        cycles = self.detect_circular_dependencies()
+        
+        if cycles:
+            print(f"发现 {len(cycles)} 个循环依赖:")
+            self_loops = []
+            complex_cycles = []
+            
+            for cycle in cycles:
+                if len(cycle) == 2 and cycle[0] == cycle[1]:
+                    # 自循环 (A -> A)
+                    self_loops.append(cycle[0])
+                else:
+                    # 复杂循环 (A -> B -> C -> A)
+                    complex_cycles.append(cycle)
+            
+            if self_loops:
+                print(f"  自循环科技 ({len(self_loops)}个):")
+                for tech in self_loops:
+                    print(f"    {tech} -> {tech}")
+            
+            if complex_cycles:
+                print(f"  复杂循环 ({len(complex_cycles)}个):")
+                for i, cycle in enumerate(complex_cycles, 1):
+                    cycle_str = " -> ".join(cycle)
+                    print(f"    循环 {i}: {cycle_str}")
+            print("")
+        else:
+            print("未发现循环依赖。")
+
     def generate_all_yml_files(self):
         output_dir = Path("output/localisation")
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -572,6 +647,8 @@ class TechTreeGenerator:
             self.scan_all_technology_files()
             self.build_technology_tree_relationships()
             self.scan_all_tech_descriptions()
+            
+            self.report_circular_dependencies()
             
             self.display_generation_statistics()
             self.generate_all_yml_files()
