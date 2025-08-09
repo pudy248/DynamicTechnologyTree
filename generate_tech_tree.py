@@ -36,32 +36,42 @@ class Technology:
 
 class TechTreeGenerator:
     
+    # 研究领域对应的图标（游戏内富文本标记），用于在最终描述中渲染小图标
     RESEARCH_AREA_ICONS = {
         "physics": "£physics£",
         "engineering": "£engineering£", 
         "society": "£society£"
     }
     
+    # 受支持的语言及其YML文件头（Stellaris本地化约定）
     SUPPORTED_LANGUAGES = {
         "english": "l_english",
         "simp_chinese": "l_simp_chinese"
     }
     
+    # 少量UI文案（按语言）
     LOCALIZATION_STRINGS = {
         "english": {
             "title": "Technology Tree",
             "top_level": "Maximum Level Reached",
             "requires": "Requires",
-            "tier_label": "Tier:"
+            "tier_label": "Tier:",
+            "already_shown": "already shown above",
+            "skip_long_tree": "Too many follow-up technologies. Not displayed for performance."
         },
         "simp_chinese": {
             "title": "科技树",
             "top_level": "已达到顶级", 
             "requires": "还需",
-            "tier_label": "级别:"
+            "tier_label": "级别:",
+            "already_shown": "已在上方展示",
+            "skip_long_tree": "后续科技太多，性能原因不做展示"
         }
     }
     
+    # 解析科技文件所用的核心正则：
+    # - TECH_DEFINITION_REGEX：匹配 tech_id = { 的起始位置
+    # - 其余正则匹配常见键，如 prerequisites/cost/category/potential 等
     TECH_DEFINITION_REGEX = re.compile(r'(?m)^(\w+)\s*=\s*\{')
     PREREQUISITES_REGEX = re.compile(r'prerequisites\s*=\s*\{')
     COST_REGEX = re.compile(r'cost\s*=\s*([@\w\d]+)')
@@ -86,8 +96,16 @@ class TechTreeGenerator:
         
         self.current_mod_folder_name = Path(__file__).parent.name
 
+        self.LONG_TREE_THRESHOLD = 100
+        self.overlong_tech_ids = set()
+
         
     def _load_configuration(self, config_path: str) -> tuple:
+    # 从 config.ini 读取：
+    # - 游戏本体路径 base_game_path
+    # - MOD 根目录路径 mod_folder_path
+    # - 可选的MOD过滤策略（白名单/黑名单/关闭）
+    # - 可选的“汉化集中化”MOD列表（这些MOD的中文描述将不再从其它MOD重复读取）
         config = configparser.ConfigParser()
         config.read(config_path, encoding='utf-8')
         
@@ -119,6 +137,9 @@ class TechTreeGenerator:
         return base_path, mod_path, mod_filter_settings, localization_mod_list
     
     def _should_include_mod(self, mod_id: str) -> bool:
+    # 判定是否扫描某个MOD：
+    # - 当前生成器所在的MOD自身不参与扫描（避免自举干扰）
+    # - 启用过滤时，若配置了白名单，则仅白名单通过；否则若配置黑名单，则黑名单排除；都未配置则全部通过
         if mod_id == self.current_mod_folder_name:
             return False
             
@@ -134,6 +155,7 @@ class TechTreeGenerator:
         return True
     
     def _should_scan_mod_localization(self, mod_id: str) -> bool:
+    # 若某MOD在“汉化集中化”列表中，则不扫描其本地化
         if mod_id in self.localization_mod_list:
             return False
             
@@ -155,6 +177,7 @@ class TechTreeGenerator:
             print("汉化MOD: 未配置")
         
     def scan_all_technology_files(self):
+    # 扫描顺序：先本体，再MOD；用于随后统计“本体/非本体”的科技数量
         self._display_mod_filter_info()
         
         self._scan_technology_path(Path(self.base_game_path) / "common" / "technology", "游戏本体科技文件")
@@ -190,6 +213,7 @@ class TechTreeGenerator:
         return len(self.all_technologies) - before_count
                     
     def _parse_single_tech_file(self, filepath: Path):
+    # 读取并去掉注释后，按“tech_id = { ... }”为单位切片，再解析每个区块
         content = self._read_file_with_encoding(filepath)
         if not content:
             return
@@ -214,6 +238,7 @@ class TechTreeGenerator:
                 return ""
 
     def _remove_comments_from_content(self, content: str) -> str:
+    # Stellaris脚本以 # 为行内注释，此处粗略去除注释，保留注释前的内容
         lines = []
         for line in content.splitlines():
             if line.lstrip().startswith('#'):
@@ -224,6 +249,8 @@ class TechTreeGenerator:
         return '\n'.join(lines)
 
     def _extract_braced_block(self, content: str, start_pos: int) -> str:
+    # 从 start_pos 开始，假设当前位置紧随一个“{”，使用括号深度计数法，查找与之匹配的“}”
+    # 返回不包含首尾大括号的内部文本；若未能闭合（括号不匹配），返回空字符串
         brace_depth = 1
         for i, char in enumerate(content[start_pos:], start_pos):
             if char == '{':
@@ -235,6 +262,9 @@ class TechTreeGenerator:
         return ""
 
     def _parse_tech_block_content(self, tech: Technology, content: str):
+    # 逐项解析科技区块内的键：
+    # - area / tier / prerequisites / cost / category / (starting_)potential
+    # - is_dangerous / is_repeatable（也可以由ID或显式标记获得）
         if area_match := self.RESEARCH_AREA_REGEX.search(content):
             tech.research_area = area_match.group(1)
         
@@ -247,6 +277,7 @@ class TechTreeGenerator:
             tech.prerequisite_tech_ids = [m_id if m_id else w_id for m_id, w_id in tech_matches]
         
         if self.STARTING_TECH_REGEX.search(content):
+            # 起始科技明确无前置
             tech.prerequisite_tech_ids = []
             
         if cost_match := self.COST_REGEX.search(content):
@@ -268,6 +299,8 @@ class TechTreeGenerator:
         self._scan_chinese_tech_descriptions()
 
     def _scan_english_tech_descriptions(self):
+    # 先从本体 localisation 提取英文描述，再扫描MOD；
+    # 非本体的英文描述也会回填到中文缺省，以便至少有英文文案可用
         base_localisation_path = Path(self.base_game_path) / "localisation"
         if base_localisation_path.exists():
             files = list(base_localisation_path.rglob("*l_english*.yml"))
@@ -287,6 +320,7 @@ class TechTreeGenerator:
                         self._scan_mod_english_localization_files(mod_localisation_path)
 
     def _scan_chinese_tech_descriptions(self):
+    # 中文描述的优先级：本体 -> 配置的集中汉化MOD -> 其余MOD（受过滤规则影响）
         found_chinese_descriptions = {}
         
         base_localisation_path = Path(self.base_game_path) / "localisation"
@@ -347,6 +381,8 @@ class TechTreeGenerator:
         return found_count
 
     def _parse_chinese_description_file(self, filepath: Path, found_descriptions: dict) -> int:
+    # DESCRIPTION_LOCALIZATION_REGEX 只匹配 "xxx_desc:0 \"...\"" 形式；
+    # 对每行做轻量正则提取并清洗转义字符
         content = self._read_file_with_encoding(filepath)
         if not content:
             return 0
@@ -375,6 +411,7 @@ class TechTreeGenerator:
         return found_count
 
     def _parse_english_description_file(self, filepath: Path, is_base_game: bool):
+    # 英文描述与中文逻辑相似；若来自MOD（非本体），同时作为中文的兜底文本
         content = self._read_file_with_encoding(filepath)
         if not content:
             return
@@ -401,18 +438,45 @@ class TechTreeGenerator:
                         self.tech_descriptions[tech_id]["simp_chinese"] = description
 
     def _clean_description_text(self, description: str) -> str:
+    # 去除常见的转义与多余空白，保持单行
         description = description.replace('\\"', '"').replace('\\n', ' ').replace('\\t', ' ')
         return self.WHITESPACE_CLEANUP_REGEX.sub(' ', description).strip()
             
     def build_technology_tree_relationships(self):
+    # 将“前置->后继”的引用补全：对每个科技A，其前置B们都追加 A 到 B.unlocked_tech_ids
         for tech in self.all_technologies.values():
             for prereq_id in tech.prerequisite_tech_ids:
                 if prereq_id in self.all_technologies:
                     prereq_tech = self.all_technologies[prereq_id]
                     if tech.tech_id not in prereq_tech.unlocked_tech_ids:
                         prereq_tech.unlocked_tech_ids.append(tech.tech_id)
+
+    # 计算某科技的唯一可达后继科技数量
+    def _count_unique_successors(self, tech_id: str) -> int:
+    # 使用显式栈进行有向图的可达节点计数（去重），避免递归栈过深
+        if tech_id not in self.all_technologies:
+            return 0
+        visited = set()
+        stack = list(self.all_technologies[tech_id].unlocked_tech_ids)
+        while stack:
+            tid = stack.pop()
+            if tid in visited or tid not in self.all_technologies:
+                continue
+            visited.add(tid)
+            stack.extend(self.all_technologies[tid].unlocked_tech_ids)
+        return len(visited)
+
+    # 预计算超长科技树集合
+    def _precompute_overlong_trees(self) -> None:
+    # 预先计算“后继科技数量”超过阈值的根节点，生成描述时直接给出提示，避免生成超长文本
+        self.overlong_tech_ids.clear()
+        for tid in self.all_technologies.keys():
+            cnt = self._count_unique_successors(tid)
+            if cnt > self.LONG_TREE_THRESHOLD:
+                self.overlong_tech_ids.add(tid)
                         
     def _format_tech_tree_entry(self, tech_id: str, indent_level: int = 1, current_prereq: str = None, lang_code: str = "simp_chinese") -> str:
+    # 将单个科技渲染为一行：包含层级缩进、领域图标、颜色以及“还需”其它并列前置的提示
         if tech_id not in self.all_technologies:
             return ""
             
@@ -452,42 +516,61 @@ class TechTreeGenerator:
         
         return entry
         
-    def _build_tech_subtree(self, tech_id: str, current_depth: int = 0, parent_tech_id: str = None, lang_code: str = "simp_chinese", visited_techs: set = None) -> List[str]:
-        if visited_techs is None:
-            visited_techs = set()
-        
+    def _build_tech_subtree(self, tech_id: str, current_depth: int = 0, parent_tech_id: str = None, lang_code: str = "simp_chinese", path_set: set | None = None, expanded_set: set | None = None) -> List[str]:
+    # - path_set: 当前DFS路径节点集合，用于检测环（避免 A->...->A）；
+    # - expanded_set: 从根开始已展开过子树的节点集合，避免同一节点在不同路径下重复展开；
+    #   对已展开节点，仅追加一行并标注“已在上方展示”。
+        if path_set is None:
+            path_set = set()
+        if expanded_set is None:
+            expanded_set = set()
+
         if tech_id not in self.all_technologies:
             return []
-        
-        if tech_id in visited_techs:
+
+        if tech_id in path_set:
             return []
-        
+
         tech = self.all_technologies[tech_id]
-        lines = []
-        
-        visited_techs.add(tech_id)
-        
+        lines: List[str] = []
+
+        path_set.add(tech_id)
+
+        # 为了稳定与可读，按 tier 再按 tech_id 排序
         unlocked_techs = sorted(tech.unlocked_tech_ids, key=lambda tid: (
             self.all_technologies.get(tid, Technology(tid)).tier_level, tid
         ))
-        
+
+        already_shown_text = self.LOCALIZATION_STRINGS[lang_code].get("already_shown", "already shown")
+
         for unlock_id in unlocked_techs:
-            tech_line = self._format_tech_tree_entry(unlock_id, current_depth + 1, tech_id, lang_code)
-            if tech_line:
-                lines.append(tech_line)
-            
-            subtree_lines = self._build_tech_subtree(unlock_id, current_depth + 1, unlock_id, lang_code, visited_techs.copy())
+            base_line = self._format_tech_tree_entry(unlock_id, current_depth + 1, tech_id, lang_code)
+            if not base_line:
+                continue
+
+            if (unlock_id in expanded_set) or (unlock_id in path_set):
+                lines.append(f"{base_line} §g({already_shown_text})§!")
+                continue
+
+            lines.append(base_line)
+            expanded_set.add(unlock_id)
+            subtree_lines = self._build_tech_subtree(unlock_id, current_depth + 1, unlock_id, lang_code, path_set, expanded_set)
             lines.extend(subtree_lines)
-        
-        visited_techs.remove(tech_id)
-                
+
+        path_set.remove(tech_id)
         return lines
         
     def generate_tech_tree_content(self, tech_id: str, lang_code: str = "simp_chinese") -> str:
         if tech_id not in self.all_technologies:
             return ""
-            
-        tree_lines = self._build_tech_subtree(tech_id, current_depth=0, parent_tech_id=tech_id, lang_code=lang_code)
+
+        # 超长科技树：直接返回提示，避免将巨量后继全部展开导致游戏闪退
+        if tech_id in self.overlong_tech_ids:
+            header = "\\n\\n§H$technology_tree_title$§!"
+            skip_text = self.LOCALIZATION_STRINGS[lang_code]["skip_long_tree"]
+            return f"{header}\\n§R{skip_text}§!"
+
+        tree_lines = self._build_tech_subtree(tech_id, current_depth=0, parent_tech_id=tech_id, lang_code=lang_code, path_set=set(), expanded_set=set())
         if not tree_lines:
             return "\\n\\n§H$technology_tree_title$§!\\n§Y$tech_tree_max_level$§!"
             
@@ -496,6 +579,7 @@ class TechTreeGenerator:
         return content
         
     def _get_output_file_paths(self, lang_code: str, filename: str) -> List[Path]:
+    # 将同一份localisation内容输出到多处路径，以兼容不同加载顺序策略
         base = Path("output/localisation/")
         paths = [
             base / filename,
@@ -514,6 +598,7 @@ class TechTreeGenerator:
         self._generate_tech_description_replacement_file(lang_code, lang_key)
 
     def _generate_main_tech_tree_file(self, lang_code: str, lang_key: str):
+    # 为每个科技写入一条 _techtree 文本
         file_paths = self._get_output_file_paths(lang_code, f"zztechtreemain_l_{lang_code}.yml")
         lang_config = self.LOCALIZATION_STRINGS[lang_code]
         
@@ -536,6 +621,8 @@ class TechTreeGenerator:
                 print(f"警告：无法写入文件 {file_path}: {e}")
 
     def _generate_tech_description_replacement_file(self, lang_code: str, lang_key: str):
+    # 覆盖科技描述 _desc，将原描述（若有）+ 级别 + 树状内容 拼接；
+    # 若缺失描述，不影响输出，仅统计缺失数量并提示
         file_paths = self._get_output_file_paths(lang_code, f"zztechtreereplaced_l_{lang_code}.yml")
         lines = [f"{lang_key}:"]
         
@@ -571,6 +658,10 @@ class TechTreeGenerator:
 
     def detect_circular_dependencies(self) -> List[List[str]]:
         """检测科技树中的循环依赖并返回所有循环路径"""
+    # 标准DFS
+    # - visited: 全局已访问节点，避免重复起点
+    # - rec_stack: 当前递归路径集合，遇到已在栈中的点即发现一条环
+    # - path: 为了输出路径，遇环时截取从首次出现到当前的片段
         cycles = []
         visited = set()
         rec_stack = set()
@@ -647,6 +738,9 @@ class TechTreeGenerator:
             self.scan_all_technology_files()
             self.build_technology_tree_relationships()
             self.scan_all_tech_descriptions()
+
+            print("正在统计科技树规模...")
+            self._precompute_overlong_trees()
             
             self.report_circular_dependencies()
             
@@ -661,6 +755,7 @@ class TechTreeGenerator:
             traceback.print_exc()
 
     def calculate_generation_statistics(self):
+    # 基本计数统计：总数/本体/危险/循环科技/按领域/按级别等
         stats = {
             'total': len(self.all_technologies),
             'base': len(self.base_game_tech_ids),
@@ -680,6 +775,8 @@ class TechTreeGenerator:
         english_count = sum(1 for descs in self.tech_descriptions.values() if "english" in descs)
         chinese_count = sum(1 for descs in self.tech_descriptions.values() if "simp_chinese" in descs)
         print(f"本地化: 英文 {english_count}个, 中文 {chinese_count}个")
+        if self.overlong_tech_ids:
+            print(f"超长科技树(>{self.LONG_TREE_THRESHOLD} 后续科技) 数量: {len(self.overlong_tech_ids)} —— 游戏内不予展示")
 
 
 def main():
