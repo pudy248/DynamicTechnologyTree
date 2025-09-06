@@ -112,6 +112,7 @@ class TechTreeGenerator:
         try:
             base_path = config.get('paths', 'base_game_path')
             mod_path = config.get('paths', 'mod_folder_path')
+            dlc_load_path = config.get('paths', 'dlc_load_path', fallback='').strip()
         except (configparser.NoSectionError, configparser.NoOptionError) as e:
             raise ValueError(f"配置文件缺少必需的配置项: {e}")
         
@@ -127,6 +128,15 @@ class TechTreeGenerator:
             included_str = config.get('mod_filter', 'included_mods', fallback='').strip()
             if included_str:
                 mod_filter_settings['included_mods'] = {mod.strip() for mod in included_str.split(',') if mod.strip()}
+
+            if dlc_load_path:
+                # Probably a better way to do this
+                dlc_load_path = os.getenv("HOMEPATH") + dlc_load_path + "\\dlc_load.json"
+                if Path(dlc_load_path).exists():
+                    text = self._read_file_with_encoding(Path(dlc_load_path))
+                    text = text[17:-21].replace("\"mod/", "").replace(".mod\"", "").replace("ugc_", "")
+                    # Also includes locally installed mod names, support could be added for loading them
+                    mod_filter_settings['included_mods'].update(text.split(','))
         
         localization_mod_list = []
         if config.has_section('chinese_localization'):
@@ -146,13 +156,15 @@ class TechTreeGenerator:
         if not self.mod_filter_settings['enable_filter']:
             return True
         
+        should_include = False
+        
         if self.mod_filter_settings['included_mods']:
-            return mod_id in self.mod_filter_settings['included_mods']
+            should_include = mod_id in self.mod_filter_settings['included_mods']
         
         if self.mod_filter_settings['ignored_mods']:
-            return mod_id not in self.mod_filter_settings['ignored_mods']
+            should_include = should_include and mod_id not in self.mod_filter_settings['ignored_mods']
         
-        return True
+        return should_include
     
     def _should_scan_mod_localization(self, mod_id: str) -> bool:
     # 若某MOD在“汉化集中化”列表中，则不扫描其本地化
